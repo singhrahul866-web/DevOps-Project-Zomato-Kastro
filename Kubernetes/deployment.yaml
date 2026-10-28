@@ -16,6 +16,6 @@ spec:
     spec:
       containers:
       - name: zomato
-        image: teqvivek123/zomato-kastro
+        image:rahul1ranjan451/zomato-kastro
         ports:
         - containerPort: 3000
