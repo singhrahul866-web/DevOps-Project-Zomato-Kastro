@@ -1,12 +1,12 @@
 
+
 pipeline {
-    agent {
-        label 'jenkins_agent'
-    }
+    agent any
 
     options {
         timestamps()
         disableConcurrentBuilds()
+
         buildDiscarder(logRotator(
             numToKeepStr: '10',
             artifactNumToKeepStr: '5'
@@ -15,404 +15,247 @@ pipeline {
 
     environment {
         // GitHub
-        GIT_URL          = 'https://github.com/cloudvivek/DevOps-Project-Zomato-Kastro.git'
-        GIT_BRANCH       = 'master'
-
-        // SonarQube
-        SONAR_URL        = 'http://15.206.75.174:9000'
-        SONAR_PROJECT    = 'zomato-kastro'
-
-        // Dependency-Track
-        DT_URL           = 'http://15.206.75.174:8087'
-        DT_PROJECT_NAME  = 'DevOps-Project-Zomato-Kastro'
-        DT_PROJECT_VERSION = 'master'
+        GIT_URL = 'https://github.com/cloudvivek/DevOps-Project-Zomato-Kastro.git'
+        GIT_BRANCH = 'master'
 
         // Docker Hub
-        DOCKER_IMAGE     = 'teqvivek123/zomato-kastro'
+        DOCKER_IMAGE = 'teqvivek123/zomato-kastro'
 
-        // Reports
-        REPORT_DIR       = 'security-reports'
+        // Build log
+        BUILD_LOG = 'build_output.log'
+
+        // Local Ollama
+        OLLAMA_MODEL = 'qwen2.5-coder:3b'
+        OLLAMA_URL = 'http://localhost:11434/api/generate'
     }
 
     stages {
 
-        // --------------------------------------------------
+        // ==================================================
         // 1. CHECKOUT
-        // --------------------------------------------------
+        // ==================================================
+
         stage('Checkout') {
             steps {
-                deleteDir()
+                sh '''#!/bin/bash
+set -Eeuo pipefail
 
-                git branch: "${GIT_BRANCH}",
-                    url: "${GIT_URL}"
+# Initialize log for this build
+: > "$WORKSPACE/$BUILD_LOG"
 
-                sh '''
-                    echo "======================================"
-                    echo "GitHub Checkout Successful"
-                    echo "======================================"
+# Capture output in console and log
+exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
 
-                    git log -1 --oneline
-                    echo "Repository: $GIT_URL"
-                    echo "Branch: $GIT_BRANCH"
+echo "=========================================="
+echo "              CHECKOUT STAGE"
+echo "=========================================="
 
-                    mkdir -p "$REPORT_DIR"
-                '''
+echo "Repository: $GIT_URL"
+echo "Branch: $GIT_BRANCH"
+
+echo ""
+echo "Latest Git commit:"
+git log -1 --oneline
+
+echo ""
+echo "Checking required project files..."
+
+test -f package.json
+test -f Dockerfile
+test -f self_heal.sh
+
+echo "package.json       : FOUND"
+echo "Dockerfile         : FOUND"
+echo "self_heal.sh       : FOUND"
+
+echo ""
+echo "Checkout verification completed."
+'''
             }
         }
 
-        // --------------------------------------------------
-        // 2. GITLEAKS SECRET SCAN
-        // --------------------------------------------------
-        stage('Gitleaks Secret Scan') {
+        // ==================================================
+        // 2. NODE.JS INSTALL AND BUILD
+        // ==================================================
+
+        stage('Node.js Install and Build') {
             steps {
-                sh '''
-                    set +e
+                sh '''#!/bin/bash
+set -Eeuo pipefail
 
-                    mkdir -p "$REPORT_DIR"
-                    rm -f "$REPORT_DIR/gitleaks-report.json"
+exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
 
-                    echo "===== Gitleaks Secret Scan ====="
+echo "=========================================="
+echo "         NODE.JS INSTALL AND BUILD"
+echo "=========================================="
 
-                    docker run --rm \
-                        -v "$WORKSPACE:/repo" \
-                        -w /repo \
-                        zricethezav/gitleaks:latest \
-                        detect \
-                        --no-git \
-                        --source=/repo \
-                        --report-format=json \
-                        --report-path=/repo/security-reports/gitleaks-report.json \
-                        --redact \
-                        --exit-code=0 \
-                        --ignore-path=security-reports
+test -f package.json
 
-                    RC=$?
+echo "Starting Node.js container..."
 
-                    if [ ! -f "$REPORT_DIR/gitleaks-report.json" ]; then
-                        echo "[]" > "$REPORT_DIR/gitleaks-report.json"
-                        echo "Gitleaks did not create a report." \
-                            > "$REPORT_DIR/gitleaks-error.txt"
-                    fi
+docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/tmp \
+    -e NPM_CONFIG_CACHE=/tmp/.npm \
+    -v "$WORKSPACE:/app" \
+    -w /app \
+    node:20-alpine \
+    sh -lc '
+        set -eu
 
-                    echo "Gitleaks execution exit code: $RC"
+        echo "Node version:"
+        node --version
 
-                    python3 -c '
-import json
-with open("security-reports/gitleaks-report.json") as f:
-    findings = json.load(f)
-print("Total Gitleaks findings:", len(findings))
-for item in findings:
-    print("Rule:", item.get("RuleID"),
-          "| File:", item.get("File"),
-          "| Line:", item.get("StartLine"))
-'
+        echo ""
+        echo "NPM version:"
+        npm --version
 
-                    if [ "$RC" -ne 0 ]; then
-                        echo "Gitleaks execution failed." \
-                            > "$REPORT_DIR/gitleaks-error.txt"
-                    fi
+        echo ""
+        echo "Installing dependencies..."
 
-                    echo "Gitleaks scan stage completed."
-                    exit 0
-                '''
+        if [ -f package-lock.json ]; then
+            npm ci
+        else
+            npm install
+        fi
+
+        echo ""
+        echo "Checking build script..."
+
+        BUILD_SCRIPT=$(npm pkg get scripts.build)
+
+        if [ "$BUILD_SCRIPT" != "undefined" ] && [ "$BUILD_SCRIPT" != "{}" ]; then
+            echo "Build script found."
+            npm run build
+        else
+            echo "No build script found. Skipping build."
+        fi
+    '
+
+echo ""
+echo "Node.js build completed successfully."
+'''
             }
         }
 
-        // --------------------------------------------------
-        // 3. TRIVY FILESYSTEM SCAN
-        // --------------------------------------------------
-        stage('Trivy Filesystem Scan') {
-            steps {
-                sh '''
-                    set +e
+        // ==================================================
+        // 3. BUILD DOCKER IMAGE
+        // ==================================================
 
-                    mkdir -p "$REPORT_DIR"
-                    rm -f "$REPORT_DIR/trivy-report.json"
-                    rm -f "$REPORT_DIR/trivy-report.txt"
-
-                    echo "===== Trivy JSON Scan ====="
-
-                    docker run --rm \
-                        -v "$WORKSPACE:/path" \
-                        aquasec/trivy:latest \
-                        fs \
-                        --scanners vuln,misconfig,secret \
-                        --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
-                        --skip-dirs /path/node_modules \
-                        --skip-dirs /path/.git \
-                        --skip-dirs /path/security-reports \
-                        --format json \
-                        --output /path/security-reports/trivy-report.json \
-                        --exit-code 0 \
-                        /path
-
-                    JSON_RC=$?
-
-                    echo "===== Trivy Table Scan ====="
-
-                    docker run --rm \
-                        -v "$WORKSPACE:/path" \
-                        aquasec/trivy:latest \
-                        fs \
-                        --scanners vuln,misconfig,secret \
-                        --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
-                        --skip-dirs /path/node_modules \
-                        --skip-dirs /path/.git \
-                        --skip-dirs /path/security-reports \
-                        --format table \
-                        --output /path/security-reports/trivy-report.txt \
-                        --exit-code 0 \
-                        /path
-
-                    TABLE_RC=$?
-
-                    echo "Trivy JSON exit code: $JSON_RC"
-                    echo "Trivy table exit code: $TABLE_RC"
-
-                    if [ "$JSON_RC" -ne 0 ] || [ "$TABLE_RC" -ne 0 ]; then
-                        echo "Trivy execution failed." \
-                            > "$REPORT_DIR/trivy-scan-error.txt"
-                    fi
-
-                    if [ -f "$REPORT_DIR/trivy-report.txt" ]; then
-                        cat "$REPORT_DIR/trivy-report.txt"
-                    fi
-
-                    exit 0
-                '''
-            }
-        }
-
-        // --------------------------------------------------
-        // 4. SONARQUBE ANALYSIS
-        // --------------------------------------------------
-        stage('SonarQube Scan') {
-            steps {
-                withCredentials([
-                    string(
-                        credentialsId: 'sonar-token',
-                        variable: 'SONAR_TOKEN'
-                    )
-                ]) {
-                    sh '''
-                        set -eu
-
-                        echo "===== SonarQube Analysis ====="
-
-                        docker run --rm \
-                            -v "$WORKSPACE:/usr/src" \
-                            -w /usr/src \
-                            -e SONAR_HOST_URL="$SONAR_URL" \
-                            -e SONAR_TOKEN="$SONAR_TOKEN" \
-                            sonarsource/sonar-scanner-cli:latest \
-                            -Dsonar.projectKey="$SONAR_PROJECT" \
-                            -Dsonar.projectName="Zomato Kastro" \
-                            -Dsonar.sources=src \
-                            -Dsonar.scm.provider=git \
-                            -Dsonar.exclusions="node_modules/**,**/node_modules/**,**/dist/**,**/build/**,security-reports/**"
-
-                        echo "SonarQube analysis submitted successfully."
-                    '''
-                }
-            }
-        }
-
-        // --------------------------------------------------
-        // 5. GENERATE SBOM
-        // --------------------------------------------------
-        stage('Generate SBOM') {
-            steps {
-                sh '''
-                    set -eu
-
-                    mkdir -p "$REPORT_DIR"
-
-                    echo "===== Generating CycloneDX SBOM ====="
-
-                    docker run --rm \
-                        -v "$WORKSPACE:/repo" \
-                        aquasec/trivy:latest \
-                        fs /repo \
-                        --skip-dirs /repo/.git \
-                        --skip-dirs /repo/node_modules \
-                        --skip-dirs /repo/security-reports \
-                        --format cyclonedx \
-                        --output /repo/security-reports/sbom.cdx.json
-
-                    test -s "$REPORT_DIR/sbom.cdx.json"
-
-                    echo "SBOM generated successfully."
-                '''
-            }
-        }
-
-        // --------------------------------------------------
-        // 6. DEPENDENCY-TRACK UPLOAD
-        // --------------------------------------------------
-        stage('Upload SBOM to Dependency-Track') {
-            steps {
-                withCredentials([
-                    string(
-                        credentialsId: 'DT-token-k8s',
-                        variable: 'DT_API_KEY'
-                    )
-                ]) {
-                    sh '''
-                        set -eu
-                        set +x
-
-                        echo "===== Dependency-Track SBOM Upload ====="
-
-                        curl --fail --silent --show-error \
-                            --connect-timeout 15 \
-                            --max-time 120 \
-                            --request POST \
-                            --url "$DT_URL/api/v1/bom" \
-                            --header "X-Api-Key: $DT_API_KEY" \
-                            --form "autoCreate=true" \
-                            --form "projectName=$DT_PROJECT_NAME" \
-                            --form "projectVersion=$DT_PROJECT_VERSION" \
-                            --form "bom=@security-reports/sbom.cdx.json;type=application/json" \
-                            --output "$REPORT_DIR/dt-upload-response.json"
-
-                        echo "SBOM upload request accepted."
-                        echo "Project: $DT_PROJECT_NAME"
-                        echo "Version: $DT_PROJECT_VERSION"
-                    '''
-                }
-            }
-        }
-
-        // --------------------------------------------------
-        // 7. NODE.JS DEPENDENCY INSTALL & BUILD
-        // --------------------------------------------------
-        stage(
-stage('Node.js Install and Build') {
-    steps {
-        sh '''
-            set -eu
-
-            echo "===== Node.js Project Build ====="
-
-            test -f package.json
-
-            docker run --rm \
-                -v "$WORKSPACE:/app" \
-                -w /app \
-                node:20-alpine \
-                sh -lc '
-                    set -eu
-
-                    echo "Node version:"
-                    node --version
-
-                    echo "NPM version:"
-                    npm --version
-
-                    echo "Installing dependencies..."
-
-                    npm ci --no-audit --no-fund
-
-                    echo "Checking build script..."
-
-                    if node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
-                        echo "Build script found."
-                        npm run build
-                    else
-                        echo "No build script defined. Skipping build."
-                    fi
-
-                    echo "Node.js build completed successfully."
-                '
-        '''
-    }
-}
-
-                '''
-            }
-        }
-
-        // --------------------------------------------------
-        // 8. BUILD DOCKER IMAGE
-        // --------------------------------------------------
         stage('Build Docker Image') {
             steps {
-                sh '''
-                    set -eu
+                sh '''#!/bin/bash
+set -Eeuo pipefail
 
-                    echo "===== Docker Image Build ====="
+exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
 
-                    test -f Dockerfile
+echo "=========================================="
+echo "           DOCKER IMAGE BUILD"
+echo "=========================================="
 
-                    docker build \
-                        --pull \
-                        -t "$DOCKER_IMAGE:$BUILD_NUMBER" \
-                        -t "$DOCKER_IMAGE:latest" \
-                        .
+test -f Dockerfile
 
-                    echo "Docker image built successfully."
-                    docker images "$DOCKER_IMAGE"
-                '''
-            }
-        }
+echo ""
+echo "=========================================="
+echo "          INTENTIONAL FAILURE TEST"
+echo "=========================================="
 
-        // --------------------------------------------------
-        // 9. PUSH IMAGE TO DOCKER HUB
-        // --------------------------------------------------
-        stage('Push Image to Docker Hub') {
-            steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'docker-cred',
-                        usernameVariable: 'DOCKER_USER',
-                        passwordVariable: 'DOCKER_PASSWORD'
-                    )
-                ]) {
-                    sh '''
-                        set -eu
-                        set +x
+echo "Image: $DOCKER_IMAGE"
+echo "Build: $BUILD_NUMBER"
 
-                        echo "===== Docker Hub Login ====="
+echo ""
+echo "Executing Docker command:"
 
-                        printf '%s' "$DOCKER_PASSWORD" |
-                            docker login \
-                                --username "$DOCKER_USER" \
-                                --password-stdin
+echo "docker builds --pull -t $DOCKER_IMAGE:$BUILD_NUMBER -t $DOCKER_IMAGE:latest ."
 
-                        echo "===== Pushing Docker Images ====="
+echo ""
+echo "Starting Docker image build..."
 
-                        docker push "$DOCKER_IMAGE:$BUILD_NUMBER"
-                        docker push "$DOCKER_IMAGE:latest"
+# INTENTIONAL ERROR FOR AI SIMULATION
+# Correct command would be: docker build
+docker builds \
+    --pull \
+    -t "$DOCKER_IMAGE:$BUILD_NUMBER" \
+    -t "$DOCKER_IMAGE:latest" \
+    .
 
-                        echo "Images pushed successfully:"
-                        echo "$DOCKER_IMAGE:$BUILD_NUMBER"
-                        echo "$DOCKER_IMAGE:latest"
-
-                        docker logout
-                    '''
-                }
+echo ""
+echo "Docker image build completed successfully."
+'''
             }
         }
     }
 
+    // ======================================================
+    // POST BUILD ACTIONS
+    // ======================================================
+
     post {
-        always {
-            archiveArtifacts(
-                artifacts: 'security-reports/**',
-                allowEmptyArchive: true,
-                fingerprint: true
-            )
-
-            echo 'Security reports and SBOM are available under Build → Artifacts.'
-        }
-
-        success {
-            echo 'Pipeline completed successfully.'
-            echo 'GitHub → Gitleaks → Trivy → SonarQube → SBOM → Dependency-Track → Node.js Build → Docker Build → Docker Hub Push'
-        }
 
         failure {
-            echo 'Pipeline failed. Review Console Output to identify the failed stage.'
+            echo 'AI Self-Healing Agent triggered.'
+
+            sh '''#!/bin/bash
+set -u
+
+echo "=========================================="
+echo "       AI SELF-HEALING EXECUTION"
+echo "=========================================="
+
+LOG_FILE="$WORKSPACE/$BUILD_LOG"
+
+echo "Build number : $BUILD_NUMBER"
+echo "Build log    : $LOG_FILE"
+echo "AI model     : $OLLAMA_MODEL"
+echo "Ollama URL   : $OLLAMA_URL"
+
+if [ ! -s "$LOG_FILE" ]; then
+    echo "ERROR: Build log is missing or empty."
+    exit 1
+fi
+
+echo ""
+echo "Build log successfully captured."
+
+echo ""
+echo "Failure details:"
+grep -E 'Executing Docker command:|docker builds|unknown flag|not a docker command' \
+    "$LOG_FILE" | tail -n 20 || true
+
+echo ""
+echo "Invoking Ollama AI analyzer..."
+
+AI_STATUS=0
+
+bash "$WORKSPACE/self_heal.sh" "$LOG_FILE" || AI_STATUS=$?
+
+if [ "$AI_STATUS" -ne 0 ]; then
+    echo "WARNING: AI analysis failed with exit code $AI_STATUS."
+else
+    echo "AI analysis completed."
+fi
+
+echo ""
+echo "Archiving AI analysis report..."
+
+echo "=========================================="
+echo "AI SELF-HEALING EXECUTION FINISHED"
+echo "=========================================="
+'''
+
+            archiveArtifacts(
+                artifacts: 'ai-reports/*.md',
+                allowEmptyArchive: true
+            )
+        }
+
+        always {
+            echo 'Pipeline execution completed.'
+
+            archiveArtifacts(
+                artifacts: 'build_output.log',
+                allowEmptyArchive: true
+            )
         }
     }
 }
